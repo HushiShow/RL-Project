@@ -7,6 +7,7 @@ import torch.optim as optim
 from torch.distributions import Normal
 import os
 import gymnasium as gym
+from gymnasium.wrappers import RecordEpisodeStatistics, RecordVideo
 
 
 class ReplayBuffer:
@@ -181,7 +182,7 @@ class ActorNetwork(nn.Module):
 class Agent():
     def __init__(self, alpha=1e-4, beta=1e-4, input_dims=[8],
                  env=None, gamma=0.99, n_actions=2, max_size=1_000_000, tau=5e-3,
-                 layer1_size=256, layer2_size=256, batch_size=256, reward_scale=2):
+                 layer1_size=256, layer2_size=256, batch_size=256, reward_scale=1.0):
         self.gamma = gamma
         self.tau = tau
         self.memory = ReplayBuffer(max_size, input_dims, n_actions)
@@ -201,7 +202,14 @@ class Agent():
         self.value = ValueNetwork(beta, input_dims, name='value')
         self.target_value = ValueNetwork(beta, input_dims, name='target_value')
 
-        self.scale = reward_scale
+        if reward_scale <= 0:
+            raise ValueError("reward_scale must be positive to init temp.")
+
+        self.target_entropy = -float(np.prod(env.action_space.shape))
+        self.log_alpha = torch.tensor(np.log(reward_scale), dtype=torch.float32,
+                                      device=self.actor.device, requires_grad=True)
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=alpha)
+        self.alpha_ckpt_file = os.path.join(self.actor.ckpt_dir, 'alpha')
         self.update_network_parameters(tau=1)
 
     def choose_action(self, obs):
@@ -236,6 +244,7 @@ class Agent():
         self.target_value.save()
         self.critic_1.save()
         self.critic_2.save()
+        torch.save(self.log_alpha.detach().cpu(), self.alpha_ckpt_file)
 
     def load_models(self):
         self.actor.load()
@@ -243,6 +252,12 @@ class Agent():
         self.target_value.load()
         self.critic_1.load()
         self.critic_2.load()
+        loaded_alpha = None
+        if os.path.exists(self.alpha_ckpt_file):
+            loaded_alpha = torch.load(self.alpha_ckpt_file, map_location=self.actor.device)
+
+        if loaded_alpha is not None:
+            self.log_alpha.data.copy_(loaded_alpha.to(self.actor.device))
     
     def learn(self):
         if self.memory.mem_cntr < self.batch_size:
@@ -269,7 +284,8 @@ class Agent():
         critic_value = critic_value.view(-1)
 
         self.value.optimizer.zero_grad()
-        value_target = (critic_value - log_probs).detach()
+        alpha = self.log_alpha.exp()
+        value_target = (critic_value - alpha.detach() * log_probs).detach()
         value_loss = 0.5 * F.mse_loss(value, value_target)
         value_loss.backward()
         self.value.optimizer.step()
@@ -281,15 +297,20 @@ class Agent():
         critic_value = torch.min(q1_new_policy, q2_new_policy)
         critic_value = critic_value.view(-1)
 
-        actor_loss = log_probs - critic_value
+        actor_loss = alpha.detach() * log_probs - critic_value
         actor_loss = torch.mean(actor_loss)
         self.actor.optimizer.zero_grad()
         actor_loss.backward()
         self.actor.optimizer.step()
 
+        alpha_loss = -(self.log_alpha * (log_probs.detach() + self.target_entropy)).mean()
+        self.alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optimizer.step()
+
         self.critic_1.optimizer.zero_grad()
         self.critic_2.optimizer.zero_grad()
-        q_hat = self.scale*reward + self.gamma*value_.detach()
+        q_hat = reward + self.gamma*value_.detach()
         q1_old_policy = self.critic_1.forward(state, action).view(-1)
         q2_old_policy = self.critic_2.forward(state, action).view(-1)
         critic_1_loss = 0.5 * F.mse_loss(q1_old_policy, q_hat)
@@ -304,23 +325,32 @@ class Agent():
 
 
 if __name__ == '__main__':
-    env = gym.make('Pendulum-v1') # switch for humanoid
+    env = gym.make('Humanoid-v5', render_mode='rgb_array') # switch for humanoid
+    env = RecordVideo(
+        env,
+        video_folder='renders',
+        episode_trigger=lambda ep: (ep + 1) % 100 == 0,
+        disable_logger=True,
+    )
+    env = RecordEpisodeStatistics(env, buffer_length=1)
     agent = Agent(input_dims=env.observation_space.shape, env=env,
                   n_actions=env.action_space.shape[0])
-    n_games = 250
+    n_games = 10_000
 
     best_score = -np.inf
     score_history = []
     load_ckpt = False
+    total_steps = 0
     
     if load_ckpt:
         agent.load_models()
         env.render()
     
     for i in range(n_games):
-        obs, _ = env.reset()
+        obs, info = env.reset()
         done = False
         score = 0
+        last_info = info
         while not done:
             action = agent.choose_action(obs)
             obs_, reward, terminated, truncated, info = env.step(action)
@@ -330,6 +360,8 @@ if __name__ == '__main__':
             if not load_ckpt:
                 agent.learn()
             obs = obs_
+            total_steps += 1
+            last_info = info
         
         score_history.append(score)
         avg_score = np.mean(score_history[-100:])
@@ -339,8 +371,15 @@ if __name__ == '__main__':
             if not load_ckpt:
                 agent.save_models()
         
-        print(f"episode: {i} score: {score}, avg_score: {avg_score}")
+        episode_steps = last_info.get('episode', {}).get('l')
+        print(
+            f"episode: {i} steps: {episode_steps if episode_steps is not None else 'N/A'} "
+            f"total_steps: {total_steps} score: {score}, avg_score: {avg_score}"
+        )
+
 
     if not load_ckpt:
         x = [i+1 for i in range(n_games)]
         #plotting
+
+    env.close()
