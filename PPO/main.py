@@ -9,9 +9,9 @@ import torch.optim as optim
 from torch.distributions import Normal
 from torch.utils.tensorboard import SummaryWriter
 
-ENV_NAME = "Humanoid-v5"
-NUM_STEPS = 1024
-NUM_EPOCHS = 100
+ENV_NAME = "Walker2d-v5"
+NUM_STEPS = 2048
+NUM_EPOCHS = 10
 MINI_BATCH_SIZE = 64
 GAMMA = 0.99
 LAM = 0.95
@@ -19,42 +19,60 @@ CLIP_EPS = 0.2
 LR = 3e-4
 ENT_COEF = 0.01
 VF_COEF = 0.5
+CLIP_COEF = 0.2
 MAX_GRAD_NORM = 0.5
-TOTAL_UPDATES = 20000
+TOTAL_UPDATES = 2000
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-PRINT_INTERVAL = 10
-SAVE_PATH = "humanoid.pt"
-
+PRINT_INTERVAL = 1
+SAVE_PATH = "Walker2d_Norm.pt"
+RENDER_MODE = None
+RUN_NAME = "walker2d-restart-14"
 
 def train(load):
-    writer = SummaryWriter()
     try:
-        env = gym.make(ENV_NAME)
+        writer = SummaryWriter(f"runs/{RUN_NAME}")
+        writer.add_text(
+            "hyperparameters",
+            f"Max steps: {NUM_STEPS},  Epochs: {NUM_EPOCHS}, mini batch size: {MINI_BATCH_SIZE}, Gamaa: {GAMMA}, LAM: {LAM}, Eplison Clipping: {CLIP_EPS}"+
+            f"Learning rate: {LR}, Entrpoy Coef: {ENT_COEF}, Value Function Coef: {VF_COEF}, Max Grad Norm: {MAX_GRAD_NORM}, Environment: {ENV_NAME}",
+        )
+        env = gym.make(ENV_NAME,render_mode=None)
         env = gym.wrappers.ClipAction(env)
-        agent = PPOAgent(env, LR, NUM_STEPS, NUM_EPOCHS, MINI_BATCH_SIZE, CLIP_EPS, VF_COEF, ENT_COEF, DEVICE)
+        #env = gym.wrappers.NormalizeObservation(env)
+        #env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10), env.observation_space)
+        #env = gym.wrappers.NormalizeReward(env)
+        #env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -100, 100))
+        agent = PPOAgent(env, LR, NUM_STEPS, NUM_EPOCHS, MINI_BATCH_SIZE, CLIP_EPS, VF_COEF, ENT_COEF,CLIP_COEF,MAX_GRAD_NORM, DEVICE)
         if load == True:
-            agent.load("humanoid.pt")
+            agent.load("Walker2d_restart2.pt")
         obs, _ = env.reset()
         ep_rewards = deque(maxlen=100)
         ep_reward = 0
         total_steps = 0
         ep_count = 0
-
+        ep_length = 0
         for update in range(1, TOTAL_UPDATES+1):
+            scale = 1.0 - (update - 1.0) / TOTAL_UPDATES
+            newlr = scale * LR
+            agent.optimizer.param_groups[0]["lr"] = newlr
             for step in range(NUM_STEPS):
+                if RENDER_MODE == "human":
+                    env.render()
                 action, logp, value = agent.select_action(obs)
-                next_obs, reward, terminated, truncated, _ = env.step(action)
+                next_obs, reward, terminated, truncated, info = env.step(action)
                 done = float(terminated or truncated)
                 ep_reward += reward
-                writer.add_scalar(reward)
+                ep_length += 1
                 agent.memory.push(obs, action, logp, reward, done, value)
                 obs = next_obs
                 total_steps += 1
-
                 if done:
+                    writer.add_scalar("charts/episodic_return", ep_reward, total_steps)
+                    writer.add_scalar("charts/episodic_length", ep_length, total_steps)
                     obs, _ = env.reset()
                     ep_rewards.append(ep_reward)
                     ep_reward = 0
+                    ep_length = 0
                     ep_count += 1
 
             # last value for GAE
@@ -71,13 +89,15 @@ def train(load):
 
     except KeyboardInterrupt:
         agent.save(SAVE_PATH)
+        writer.close()
         env.close()
         print("Training finished. Model saved to", SAVE_PATH)
 
     finally:
+        writer.close()
         agent.save(SAVE_PATH)
         env.close()
         print("Training finished. Model saved to", SAVE_PATH)
 
 if __name__ == "__main__":
-    train(True)
+    train(False)
